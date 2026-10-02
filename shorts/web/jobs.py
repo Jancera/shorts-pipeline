@@ -30,18 +30,22 @@ def stage_argv(
     url: str | None = None,
     force: bool = False,
     slugs: list[str] | None = None,
+    platform: str = "youtube",
     count: int | None = None,
     desired_length: int | None = None,
 ) -> list[str]:
     if stage == "publish":
-        argv = ["publish", name]
+        argv = ["publish", name, "--platform", platform]
         for s in slugs or []:
             argv += ["--slug", s]
         if force:
             argv.append("--force")
         return argv
-    if stage == "youtube-auth":
-        return ["youtube", "auth"]
+    if stage.endswith("-auth"):
+        p = stage[: -len("-auth")]
+        if p not in ("youtube", "tiktok"):
+            raise ValueError(f"unknown stage: {stage}")
+        return [p, "auth"]
     if stage not in ALLOWED_STAGES:
         raise ValueError(f"unknown stage: {stage}")
     if stage == "fetch":

@@ -460,6 +460,9 @@
   .cad-actions { display:flex; align-items:center; gap:.6rem; }
 
   /* ---- transmission rundown table ---- */
+  #pub-tiktok { margin-top:1.4rem; padding-top:1.1rem; border-top:1px solid var(--deck-line); }
+  .pub-note { margin:.2rem 0 .7rem; font-size:12.5px; color:var(--ink-dim); }
+  .pub-note code { font:12px var(--mono); }
   .rundown-bar {
     display:flex; align-items:center; justify-content:space-between;
     gap:1rem; flex-wrap:wrap; margin:0 0 .75rem;
@@ -719,6 +722,7 @@ let ticker = null;
 let poller = null;        // fallback GET /api/jobs/current while a job is believed running
 let assetsOpen = false;   // keep the Assets panel open across re-renders
 let ytStatusCache = null; // cached GET /api/youtube/status; reset on project switch / reconnect
+let ttStatusCache = null; // same, for GET /api/tiktok/status
 const creating = new Set();
 
 function jobHereRunning() {
@@ -836,6 +840,7 @@ async function loadList() {
 /* ---------- one project ---------- */
 async function loadProject(name) {
   ytStatusCache = null;
+  ttStatusCache = null;
   cadDraft = null;
   try {
     state = await api("GET", `/api/projects/${encodeURIComponent(name)}`);
@@ -925,7 +930,8 @@ function render() {
     </details>
 
     <div class="head"><b>Publish &amp; Schedule</b><span class="fill"></span></div>
-    <div id="pub">loading…</div>`;
+    <div id="pub">loading…</div>
+    <div id="pub-tiktok"></div>`;
 
   setBusy(runningHere || pending);
   syncMonitor(runningHere);
@@ -1317,6 +1323,10 @@ function isCadDirty(draft, saved) {
 }
 
 async function loadPublish() {
+  await Promise.all([loadYouTubePublish(), loadTikTokPublish()]);
+}
+
+async function loadYouTubePublish() {
   const box = $("#pub");
   if (!box) return;
   let status, queue;
@@ -1725,12 +1735,12 @@ async function loadPublish() {
 }
 
 function canUpload(it) {
-  return it.render === "fresh" && !it.youtube;
+  return it.render === "fresh" && !it.platform;
 }
 
 function pubRow(it, idx) {
   let renderChip;
-  if (it.youtube) {
+  if (it.platform) {
     renderChip = `<span class="rend-chip fresh">✓ Uploaded</span>`;
   } else if (it.render === "fresh") {
     renderChip = `<span class="rend-chip fresh">● Fresh render</span>`;
@@ -1747,8 +1757,8 @@ function pubRow(it, idx) {
   const padIdx = String(idx + 1).padStart(2, "0");
 
   let actionEl;
-  if (it.youtube) {
-    const ytUrl = it.youtube.url || `https://www.youtube.com/watch?v=${encodeURIComponent(it.youtube.video_id)}`;
+  if (it.platform) {
+    const ytUrl = it.platform.url || `https://www.youtube.com/watch?v=${encodeURIComponent(it.platform.video_id)}`;
     actionEl = `<a class="btn-up-link" href="${escapeHtml(ytUrl)}" target="_blank" rel="noopener">YouTube ↗</a>`;
   } else {
     const uploadable = canUpload(it);
@@ -1784,6 +1794,121 @@ function pubRow(it, idx) {
       <div class="rundown-action">
         ${actionEl}
       </div>
+    </div>`;
+}
+
+/* ---------- TikTok: a second block under the YouTube deck ----------
+   TikTok has no scheduling (an upload posts immediately), so it gets no cadence
+   or airtime editor; the YouTube cadence above doesn't apply to it. */
+async function loadTikTokPublish() {
+  const box = $("#pub-tiktok");
+  if (!box) return;
+  const project = state.name;
+  let status, queue;
+  try {
+    if (!ttStatusCache) ttStatusCache = await api("GET", "/api/tiktok/status");
+    status = ttStatusCache;
+    queue = await api("GET", `/api/projects/${encodeURIComponent(project)}/publish?platform=tiktok`);
+  } catch (err) {
+    if (state.name !== project) return;
+    box.innerHTML = `<div class="pub-status-bar"><div class="pub-status-main">
+      <span class="status-dot bad"></span><span class="err">TikTok: ${escapeHtml(err.message)}</span></div></div>`;
+    return;
+  }
+  if (state.name !== project) return;  // switched projects while the fetches were in flight
+
+  // no credentials at all: nothing here can work yet, so offer no buttons that must fail
+  const unconfigured = !status.connected && status.error === "not configured";
+  const connDot = `<span class="status-dot ${status.connected ? "ok" : "bad"}"></span>`;
+  const connText = status.connected
+    ? `<span>Connected to TikTok ${status.channel ? `<span class="channel-badge">${escapeHtml(status.channel)}</span>` : ""}</span>`
+    : `<span class="err">${status.error === "token expired" ? "TikTok token expired — reconnect" : unconfigured ? "TikTok not configured" : "TikTok not connected"}</span>`;
+  const pendingUploads = queue.items.filter(canUpload).length;
+  const itemsHtml = queue.items.length
+    ? queue.items.map((it, idx) => tiktokRow(it, idx, unconfigured)).join("")
+    : `<div class="rundown-empty">No approved ideas in the pipeline yet.</div>`;
+
+  box.innerHTML = `
+    <div class="pub-status-bar">
+      <div class="pub-status-main">${connDot}${connText}</div>
+      <button class="btn btn-sm" id="tt-connect" ${unconfigured ? "disabled" : ""}>${status.connected ? "Reconnect" : "Connect TikTok"}</button>
+    </div>
+    ${unconfigured ? `<p class="pub-note">Set <code>TIKTOK_CLIENT_KEY</code> and <code>TIKTOK_CLIENT_SECRET</code> in .env, then connect.</p>` : ""}
+    <div class="rundown-bar">
+      <span class="rundown-bar-sub">TikTok posts as soon as you upload — it has no schedule of its own.</span>
+      <button class="btn btn-run" id="tt-pub-all" ${pendingUploads > 0 && !unconfigured ? "" : "disabled"}>
+        Upload all pending (${pendingUploads})
+      </button>
+    </div>
+    <div class="rundown-table">${itemsHtml}</div>`;
+
+  $("#tt-connect", box).onclick = () => {
+    ttStatusCache = null;
+    api("POST", "/api/tiktok/auth")
+      .then(() => toast("TikTok sign-in started — follow the monitor."))
+      .catch((e) => toast(e.message, "err"));
+  };
+
+  const pubAll = $("#tt-pub-all", box);
+  pubAll.onclick = async () => {
+    const n = pendingUploads;
+    const who = status.channel ? ` · ${status.channel}` : "";
+    if (!confirm(`Upload ${n} short${n === 1 ? "" : "s"} to TikTok${who}? They post immediately.`)) return;
+    pubAll.disabled = true;
+    try {
+      await api("POST", `/api/projects/${encodeURIComponent(project)}/publish`, { platform: "tiktok" });
+      toast(`Uploading ${n} short${n === 1 ? "" : "s"} to TikTok…`);
+    } catch (err) {
+      toast(err.message, "err");
+      pubAll.disabled = false;
+    }
+  };
+
+  // scoped to this block: the YouTube deck has rows for the same slugs
+  box.querySelectorAll(".rundown-row").forEach((row) => {
+    const up = row.querySelector(".btn-up");
+    if (!up) return;
+    up.onclick = async () => {
+      up.disabled = true;
+      up.textContent = "Uploading…";
+      try {
+        await api("POST",
+          `/api/projects/${encodeURIComponent(project)}/ideas/${encodeURIComponent(row.dataset.slug)}/publish`,
+          { platform: "tiktok" });
+        toast("Uploading to TikTok…");
+      } catch (err) {
+        toast(err.message, "err");
+        up.disabled = false;
+        up.textContent = "Upload";
+      }
+    };
+  });
+}
+
+function tiktokRow(it, idx, unconfigured) {
+  const padIdx = String(idx + 1).padStart(2, "0");
+  let chip;
+  if (it.platform) chip = `<span class="rend-chip fresh" title="${escapeHtml(it.platform.publish_id || it.platform.uploaded_at || "")}">✓ Uploaded</span>`;
+  else if (it.render === "fresh") chip = `<span class="rend-chip fresh">● Fresh render</span>`;
+  else if (it.render === "stale") chip = `<span class="rend-chip stale">◐ Stale render</span>`;
+  else chip = `<span class="rend-chip missing">○ Needs render</span>`;
+
+  // TikTok's API hands back no public share URL, so an uploaded row has no link
+  const uploadable = canUpload(it) && !unconfigured;
+  const action = it.platform
+    ? `<span class="airtime-source cadence">Posted</span>`
+    : `<button class="btn btn-sm btn-up ${uploadable ? "btn-run" : ""}" ${uploadable ? "" : "disabled"}>Upload</button>`;
+
+  return `
+    <div class="rundown-row" data-slug="${escapeHtml(it.slug)}">
+      <span class="rundown-seq">#${padIdx}</span>
+      <div class="rundown-title-wrap">
+        <span class="rundown-title" title="${escapeHtml(it.title)}">${escapeHtml(it.title)}</span>
+        <span class="rundown-slug">${escapeHtml(it.slug)}</span>
+      </div>
+      <div class="rundown-status">${chip}</div>
+      <div class="rundown-airtime"><span class="airtime-dt">Posts on upload</span></div>
+      <div class="rundown-action">${action}</div>
     </div>`;
 }
 

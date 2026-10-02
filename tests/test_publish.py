@@ -3,8 +3,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from shorts.publish import (
-    build_video_body, cadence_from_manifest, iso, parse_iso, resolve_schedule,
+    cadence_from_manifest, iso, parse_iso, resolve_schedule,
 )
+from shorts.youtube import build_video_body
 
 UTC = timezone.utc
 
@@ -204,10 +205,11 @@ def _mk_project(tmp_path, cfg):
 
 def _cfg(tmp_path):
     from shorts.config import (
-        Config, IdeateCfg, RenderCfg, SubtitleCfg, TranscribeCfg, VoiceCfg, YouTubeCfg,
+        Config, IdeateCfg, RenderCfg, SubtitleCfg, TikTokCfg, TranscribeCfg, VoiceCfg,
+        YouTubeCfg,
     )
     (tmp_path / "assets").mkdir()
-    return Config(
+    cfg = Config(
         root=tmp_path, projects_dir=tmp_path / "projects", assets_dir=tmp_path / "assets",
         aspect="9:16",
         transcribe=TranscribeCfg(model="w"), ideate=IdeateCfg(model="g", desired_video_length=90),
@@ -222,6 +224,34 @@ def _cfg(tmp_path):
         openai_api_key="sk", youtube=YouTubeCfg(
             client_secret=None, token_path=tmp_path / ".youtube_token.json",
             category_id=22),
+        tiktok=TikTokCfg(
+            client_key=None, client_secret=None,
+            token_path=tmp_path / ".tiktok_token.json", privacy_level="SELF_ONLY",
+            disable_duet=False, disable_stitch=False, disable_comment=False,
+            is_aigc=False,
+        ),
+    )
+    return cfg
+
+
+def _fake_youtube_target(*, upload=None, get_credentials=None, category_id=22):
+    from functools import partial
+
+    from shorts.publish_target import PublishTarget
+
+    def default_upload(client, *, mp4_path, body):
+        return {"video_id": "vid123", "url": "https://youtu.be/vid123"}
+
+    return PublishTarget(
+        key="youtube", label="YouTube", supports_scheduling=True,
+        is_configured=lambda c: True,
+        get_credentials=get_credentials or (lambda c: object()),
+        authorize=lambda c: object(),
+        account_label=lambda creds: "chan",
+        build_client=lambda creds: creds,
+        build_body=partial(build_video_body, category_id=category_id),
+        upload=upload or default_upload,
+        parse_upload_error=lambda exc: {"message": str(exc), "abort_batch": False},
     )
 
 
@@ -260,13 +290,12 @@ def test_run_uploads_eligible_and_records(tmp_path, monkeypatch):
     _fresh_rendered_idea(project, "02-y", "Second")
 
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
     seen = []
-    def fake_insert(service, *, mp4_path, body):
+    def fake_upload(client, *, mp4_path, body):
         seen.append((mp4_path.name, body["snippet"]["title"], body["status"].get("publishAt")))
-        return {"video_id": f"v{len(seen)}", "url": f"https://youtu.be/v{len(seen)}"}
-    monkeypatch.setattr(pub, "insert_video", fake_insert)
+        return {"video_id": f"v{len(seen)}", "url": f"https://youtu.be/v{len(seen)}",
+                "privacy": "private"}
+    target = _fake_youtube_target(upload=fake_upload)
 
     start_dt = datetime.now(UTC).replace(hour=9, minute=0, second=0, microsecond=0) + timedelta(
         days=365
@@ -276,7 +305,7 @@ def test_run_uploads_eligible_and_records(tmp_path, monkeypatch):
     m.set_publish(start=start, interval_hours=24, weekdays=None)
     m.save(project.manifest_path)
 
-    pub.run(project, cfg)
+    pub.run(project, cfg, target)
 
     assert [s[0] for s in seen] == ["01-x.mp4", "02-y.mp4"]
     assert seen[0][2] == start
@@ -295,15 +324,15 @@ def test_run_skips_already_uploaded_unless_force(tmp_path, monkeypatch):
     m.save(project.manifest_path)
 
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
     calls = []
-    monkeypatch.setattr(pub, "insert_video",
-                        lambda *a, **k: calls.append(1) or {"video_id": "new", "url": "u2"})
+    def fake_upload(client, *, mp4_path, body):
+        calls.append(1)
+        return {"video_id": "new", "url": "u2"}
+    target = _fake_youtube_target(upload=fake_upload)
 
-    pub.run(project, cfg)                 # skipped
+    pub.run(project, cfg, target)                 # skipped
     assert calls == []
-    pub.run(project, cfg, force=True)     # re-uploaded
+    pub.run(project, cfg, target, force=True)     # re-uploaded
     assert calls == [1]
 
 
@@ -314,9 +343,9 @@ def test_run_propagates_auth_error(tmp_path, monkeypatch):
     import shorts.publish as pub
     from shorts.youtube import YouTubeAuthError
     def boom(_c): raise YouTubeAuthError("expired", reason="expired")
-    monkeypatch.setattr(pub, "get_credentials", boom)
+    target = _fake_youtube_target(get_credentials=boom)
     with pytest.raises(YouTubeAuthError):
-        pub.run(project, cfg)
+        pub.run(project, cfg, target)
 
 
 def test_run_isolates_per_idea_failure(tmp_path, monkeypatch):
@@ -325,24 +354,65 @@ def test_run_isolates_per_idea_failure(tmp_path, monkeypatch):
     _fresh_rendered_idea(project, "01-x")
     _fresh_rendered_idea(project, "02-y")
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
 
     class Err(Exception):
         def __init__(self): self.resp = type("R", (), {"status": 400})(); self.content = b'{"error":{"message":"bad"}}'
-    monkeypatch.setattr(pub, "HttpError", Err, raising=False)
 
-    def flaky(service, *, mp4_path, body):
+    def flaky(client, *, mp4_path, body):
         if mp4_path.name == "01-x.mp4":
             raise Err()
         return {"video_id": "v2", "url": "https://youtu.be/v2"}
-    monkeypatch.setattr(pub, "insert_video", flaky)
+    target = _fake_youtube_target(upload=flaky)
 
     with pytest.raises(SystemExit):
-        pub.run(project, cfg)
+        pub.run(project, cfg, target)
     back = Manifest.load(project.manifest_path)
     assert "youtube" not in back.get_idea("01-x")
     assert back.get_idea("02-y")["youtube"]["video_id"] == "v2"
+
+
+def test_run_isolates_per_idea_failure_aborts_batch_on_quota(tmp_path, monkeypatch):
+    # equivalent to the old HttpError-403-quota abort-batch branch, now driven
+    # by target.parse_upload_error()'s abort_batch flag instead of an
+    # isinstance(exc, HttpError) check baked into publish.run().
+    cfg = _cfg(tmp_path)
+    project = _mk_project(tmp_path, cfg)
+    _fresh_rendered_idea(project, "01-x")
+    _fresh_rendered_idea(project, "02-y")
+    import shorts.publish as pub
+    from functools import partial
+    from shorts.publish_target import PublishTarget
+
+    calls = []
+
+    def flaky(client, *, mp4_path, body):
+        calls.append(mp4_path.name)
+        if mp4_path.name == "01-x.mp4":
+            raise RuntimeError("quota exceeded")
+        # 02-y would succeed if ever attempted -- proving a wrongly-continuing
+        # implementation would leave a "youtube" key that our assertions below
+        # would then catch.
+        return {"video_id": "v2", "url": "https://youtu.be/v2"}
+
+    target = PublishTarget(
+        key="youtube", label="YouTube", supports_scheduling=True,
+        is_configured=lambda c: True,
+        get_credentials=lambda c: object(), authorize=lambda c: object(),
+        account_label=lambda creds: "chan", build_client=lambda creds: creds,
+        build_body=partial(build_video_body, category_id=22),
+        upload=flaky,
+        parse_upload_error=lambda exc: {"message": str(exc), "abort_batch": True},
+    )
+
+    with pytest.raises(SystemExit):
+        pub.run(project, cfg, target)
+    # The second idea's upload must never even be attempted: this is what
+    # distinguishes "aborted after the quota error" from "kept going
+    # regardless of abort_batch" (which would call flaky twice).
+    assert calls == ["01-x.mp4"]
+    back = Manifest.load(project.manifest_path)
+    assert "youtube" not in back.get_idea("01-x")
+    assert "youtube" not in back.get_idea("02-y")  # aborted before 02-y ran
 
 
 def test_run_slug_upload_matches_web_queue_preview(tmp_path, monkeypatch):
@@ -367,15 +437,13 @@ def test_run_slug_upload_matches_web_queue_preview(tmp_path, monkeypatch):
     assert preview["02-y"] == expected_slot
 
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
     seen = []
-    def fake_insert(service, *, mp4_path, body):
+    def fake_upload(client, *, mp4_path, body):
         seen.append((mp4_path.name, body["status"].get("publishAt")))
         return {"video_id": "v", "url": "https://youtu.be/v"}
-    monkeypatch.setattr(pub, "insert_video", fake_insert)
+    target = _fake_youtube_target(upload=fake_upload)
 
-    pub.run(project, cfg, slugs=["02-y"])
+    pub.run(project, cfg, target, slugs=["02-y"])
 
     assert [s[0] for s in seen] == ["02-y.mp4"]
     assert seen[0][1] == expected_slot
@@ -392,14 +460,14 @@ def test_run_missing_idea_file_fails_that_slug_only(tmp_path, monkeypatch):
     project.idea_file("01-x").unlink()
 
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
     seen = []
-    monkeypatch.setattr(pub, "insert_video", lambda *a, **k: seen.append(k["body"])
-                        or {"video_id": "v2", "url": "https://youtu.be/v2"})
+    def fake_upload(client, *, mp4_path, body):
+        seen.append(body)
+        return {"video_id": "v2", "url": "https://youtu.be/v2"}
+    target = _fake_youtube_target(upload=fake_upload)
 
     with pytest.raises(SystemExit):
-        pub.run(project, cfg)
+        pub.run(project, cfg, target)
     back = Manifest.load(project.manifest_path)
     assert "youtube" not in back.get_idea("01-x")
     assert back.get_idea("02-y")["youtube"]["video_id"] == "v2"
@@ -412,13 +480,109 @@ def test_run_blank_title_falls_back_to_slug(tmp_path, monkeypatch):
     _fresh_rendered_idea(project, "01-x", title="")
 
     import shorts.publish as pub
-    monkeypatch.setattr(pub, "get_credentials", lambda c: object())
-    monkeypatch.setattr(pub, "youtube_service", lambda c: object())
     seen = []
-    def fake_insert(service, *, mp4_path, body):
+    def fake_upload(client, *, mp4_path, body):
         seen.append(body["snippet"]["title"])
         return {"video_id": "v", "url": "https://youtu.be/v"}
-    monkeypatch.setattr(pub, "insert_video", fake_insert)
+    target = _fake_youtube_target(upload=fake_upload)
 
-    pub.run(project, cfg)
+    pub.run(project, cfg, target)
     assert seen == ["01-x"]
+
+
+def _fake_tiktok_target(*, upload=None):
+    from functools import partial
+
+    from shorts.publish_target import PublishTarget
+    from shorts.tiktok import build_post_info
+
+    def default_upload(client, *, mp4_path, body):
+        return {"publish_id": "pub123", "status": "PROCESSING_UPLOAD"}
+
+    return PublishTarget(
+        key="tiktok", label="TikTok", supports_scheduling=False,
+        is_configured=lambda c: True,
+        get_credentials=lambda c: object(),
+        authorize=lambda c: object(),
+        account_label=lambda creds: "tiktok_user",
+        build_client=lambda creds: creds,
+        build_body=partial(
+            build_post_info,
+            privacy_level="SELF_ONLY",
+            disable_duet=False,
+            disable_stitch=False,
+            disable_comment=False,
+            is_aigc=False,
+        ),
+        upload=upload or default_upload,
+        parse_upload_error=lambda exc: {"message": str(exc), "abort_batch": False},
+    )
+
+
+def test_run_tiktok_records_under_tiktok_key_with_planned_at(tmp_path):
+    cfg = _cfg(tmp_path)
+    project = _mk_project(tmp_path, cfg)
+    _fresh_rendered_idea(project, "01-x")
+
+    import shorts.publish as pub
+    target = _fake_tiktok_target()
+
+    pub.run(project, cfg, target, slugs=None, force=False)
+
+    manifest = Manifest.load(project.manifest_path)
+    tiktok_record = manifest.get_idea("01-x").get("tiktok")
+    assert tiktok_record is not None
+    assert "publish_id" in tiktok_record
+    assert "status" in tiktok_record
+    assert "uploaded_at" in tiktok_record
+    assert "planned_at" in tiktok_record
+    assert "publish_at" not in tiktok_record
+
+
+def test_run_youtube_and_tiktok_do_not_collide_for_same_idea(tmp_path):
+    cfg = _cfg(tmp_path)
+    project = _mk_project(tmp_path, cfg)
+    _fresh_rendered_idea(project, "01-x")
+
+    import shorts.publish as pub
+
+    # First, publish to YouTube
+    youtube_target = _fake_youtube_target()
+    pub.run(project, cfg, youtube_target, slugs=None, force=False)
+
+    # Reload manifest to see YouTube publication
+    manifest = Manifest.load(project.manifest_path)
+    assert "youtube" in manifest.get_idea("01-x")
+
+    # Then, publish the same idea to TikTok
+    tiktok_target = _fake_tiktok_target()
+    pub.run(project, cfg, tiktok_target, slugs=None, force=False)
+
+    # Both should be present in the final manifest
+    manifest = Manifest.load(project.manifest_path)
+    idea = manifest.get_idea("01-x")
+    assert "youtube" in idea
+    assert idea["youtube"]["video_id"] == "vid123"
+    assert "tiktok" in idea
+    assert idea["tiktok"]["publish_id"] == "pub123"
+
+
+def test_run_tiktok_skips_already_published_unless_force(tmp_path):
+    cfg = _cfg(tmp_path)
+    project = _mk_project(tmp_path, cfg)
+    _fresh_rendered_idea(project, "01-x")
+    m = Manifest.load(project.manifest_path)
+    m.set_idea("01-x", tiktok={"publish_id": "old", "status": "PUBLISHED", "planned_at": None})
+    m.save(project.manifest_path)
+
+    import shorts.publish as pub
+    calls = []
+    def fake_upload(client, *, mp4_path, body):
+        calls.append(1)
+        return {"publish_id": "new", "status": "PROCESSING_UPLOAD"}
+    target = _fake_tiktok_target(upload=fake_upload)
+
+    pub.run(project, cfg, target)                 # skipped
+    assert calls == []
+    pub.run(project, cfg, target, force=True)     # re-uploaded
+    assert calls == [1]

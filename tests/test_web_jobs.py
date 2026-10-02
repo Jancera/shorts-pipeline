@@ -97,12 +97,28 @@ def test_cancel_with_nothing_running_raises(tmp_path):
 
 def test_stage_argv_publish():
     from shorts.web.jobs import stage_argv
-    assert stage_argv("publish", "demo") == ["publish", "demo"]
+    assert stage_argv("publish", "demo") == ["publish", "demo", "--platform", "youtube"]
     assert stage_argv("publish", "demo", slugs=["01-x", "02-y"], force=True) == [
-        "publish", "demo", "--slug", "01-x", "--slug", "02-y", "--force",
+        "publish", "demo", "--platform", "youtube", "--slug", "01-x", "--slug", "02-y", "--force",
     ]
+
+
+def test_stage_argv_publish_tiktok():
+    from shorts.web.jobs import stage_argv
+    assert stage_argv("publish", "demo", platform="tiktok") == ["publish", "demo", "--platform", "tiktok"]
 
 
 def test_stage_argv_youtube_auth():
     from shorts.web.jobs import stage_argv
     assert stage_argv("youtube-auth", "") == ["youtube", "auth"]
+
+
+def test_stage_argv_tiktok_auth():
+    from shorts.web.jobs import stage_argv
+    assert stage_argv("tiktok-auth", "") == ["tiktok", "auth"]
+
+
+def test_stage_argv_unknown_auth_stage_raises():
+    from shorts.web.jobs import stage_argv
+    with pytest.raises(ValueError):
+        stage_argv("bogus-auth", "")

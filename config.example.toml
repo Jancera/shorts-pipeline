@@ -43,3 +43,13 @@ enabled = true
 # client_secret = "client_secret.json"   # path to the downloaded OAuth "Desktop app" client
 # token_path    = ".youtube_token.json"  # OAuth token cache (default; git-ignored)
 category_id     = 20                      # default YouTube category (20 Gaming, 24 Entertainment, 23 Comedy, 27 Education, 28 Science & Technology, 26 Howto & Style, 10 Music, 22 People & Blogs)
+
+[tiktok]
+# App credentials come from .env (TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET), not here.
+# token_path    = ".tiktok_token.json"   # OAuth token cache (default; git-ignored)
+# TikTok posts immediately - no scheduling. Unaudited apps can only use SELF_ONLY.
+privacy_level   = "SELF_ONLY"            # SELF_ONLY | PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | FOLLOWER_OF_CREATOR
+# disable_duet    = false
+# disable_stitch  = false
+# disable_comment = false
+# is_aigc         = false                # label the post as AI-generated content

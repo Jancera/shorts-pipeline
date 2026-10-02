@@ -63,7 +63,11 @@ def test_publish_invokes_run(monkeypatch):
     import shorts.publish as pub
     seen = {}
     monkeypatch.setattr(pub, "run",
-        lambda project, config, *, slugs, force: seen.update(project=project, slugs=slugs, force=force))
+        lambda project, config, target, *, slugs, force: seen.update(
+            project=project, target=target, slugs=slugs, force=force))
     r = CliRunner().invoke(cli.cli, ["publish", "demo", "--slug", "01-x", "--slug", "02-y", "--force"])
     assert r.exit_code == 0
-    assert seen == {"project": "project:demo", "slugs": ["01-x", "02-y"], "force": True}
+    assert seen["project"] == "project:demo"
+    assert seen["slugs"] == ["01-x", "02-y"]
+    assert seen["force"] is True
+    assert seen["target"].key == "youtube"

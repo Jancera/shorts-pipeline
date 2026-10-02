@@ -284,11 +284,14 @@ def list_projects(config: Config) -> list[dict]:
     return out
 
 
-def publish_queue(project: Project, config: Config) -> dict:
+def publish_queue(project: Project, config: Config, platform: str = "youtube") -> dict:
     from datetime import datetime, timezone
 
-    # function-local on purpose: shorts.publish imports googleapiclient at module scope
+    # function-local: keeps import cost out of routes that don't touch publish/scheduling
     from shorts.publish import cadence_from_manifest, iso, parse_iso, resolve_schedule
+
+    key = platform
+    at_field = "publish_at" if platform == "youtube" else "planned_at"
 
     manifest = Manifest.load(project.manifest_path)
     sync_idea_state(project, manifest)
@@ -306,13 +309,13 @@ def publish_queue(project: Project, config: Config) -> dict:
         if e.get("publish_at"):
             overrides[s] = parse_iso(e["publish_at"])
             taken.add(overrides[s])
-        yt = e.get("youtube") or {}
-        if yt.get("publish_at"):
-            taken.add(parse_iso(yt["publish_at"]))
+        plat = e.get(key) or {}
+        if plat.get(at_field):
+            taken.add(parse_iso(plat[at_field]))
 
     slot_slugs = [
         s for s in approved
-        if fr[s]["render"] == "fresh" and not manifest.get_idea(s).get("youtube")
+        if fr[s]["render"] == "fresh" and not manifest.get_idea(s).get(key)
     ]
     sched = resolve_schedule(
         slot_slugs,
@@ -325,7 +328,7 @@ def publish_queue(project: Project, config: Config) -> dict:
     items = []
     for s in approved:
         e = manifest.get_idea(s)
-        yt = e.get("youtube")
+        plat = e.get(key)
         override_iso = e.get("publish_at") or None
         resolved = None
         from_cadence = False
@@ -343,8 +346,9 @@ def publish_queue(project: Project, config: Config) -> dict:
             "publish_at_override": override_iso,
             "publish_at": resolved,
             "from_cadence": from_cadence,
-            "youtube": {k: yt.get(k) for k in ("video_id", "url", "publish_at", "uploaded_at")}
-            if yt else None,
+            "platform": {k2: plat.get(k2) for k2 in (
+                "video_id", "publish_id", "url", "publish_at", "planned_at", "uploaded_at",
+            )} if plat else None,
         })
 
     return {"cadence": manifest.get_publish() or None, "items": items}

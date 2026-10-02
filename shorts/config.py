@@ -68,6 +68,18 @@ class YouTubeCfg:
 
 
 @dataclass(frozen=True)
+class TikTokCfg:
+    client_key: str | None
+    client_secret: str | None
+    token_path: Path
+    privacy_level: str
+    disable_duet: bool
+    disable_stitch: bool
+    disable_comment: bool
+    is_aigc: bool
+
+
+@dataclass(frozen=True)
 class Config:
     root: Path
     projects_dir: Path
@@ -79,9 +91,11 @@ class Config:
     render: RenderCfg
     openai_api_key: str
     youtube: YouTubeCfg
+    tiktok: TikTokCfg
 
 
 _ASPECTS = {"9:16", "16:9"}
+_TIKTOK_PRIVACY = {"SELF_ONLY", "PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR"}
 _SUBTITLE_POSITIONS = {"bottom", "middle", "top"}
 _HEX_COLOR = re.compile(r"^#[0-9A-Fa-f]{6}$")
 _SUBTITLE_STYLING_FIELDS = (
@@ -247,6 +261,16 @@ def load_config(root: Path | None = None) -> Config:
     if yt_category <= 0:
         raise ConfigError("youtube.category_id must be > 0")
 
+    tt = raw.get("tiktok", {})
+    tiktok_client_key = os.environ.get("TIKTOK_CLIENT_KEY", "").strip() or None
+    tiktok_client_secret = os.environ.get("TIKTOK_CLIENT_SECRET", "").strip() or None
+    tt_token = Path(str(tt.get("token_path", ".tiktok_token.json"))).expanduser()
+    if not tt_token.is_absolute():
+        tt_token = (root / tt_token).resolve()
+    tt_privacy = str(tt.get("privacy_level", "SELF_ONLY"))
+    if tt_privacy not in _TIKTOK_PRIVACY:
+        raise ConfigError(f"tiktok.privacy_level must be one of {sorted(_TIKTOK_PRIVACY)}, got {tt_privacy!r}")
+
     try:
         desired_length = int(i.get("desired_video_length", 90))
     except (ValueError, TypeError):
@@ -282,6 +306,16 @@ def load_config(root: Path | None = None) -> Config:
             client_secret=yt_secret,
             token_path=yt_token,
             category_id=yt_category,
+        ),
+        tiktok=TikTokCfg(
+            client_key=tiktok_client_key,
+            client_secret=tiktok_client_secret,
+            token_path=tt_token,
+            privacy_level=tt_privacy,
+            disable_duet=bool(tt.get("disable_duet", False)),
+            disable_stitch=bool(tt.get("disable_stitch", False)),
+            disable_comment=bool(tt.get("disable_comment", False)),
+            is_aigc=bool(tt.get("is_aigc", False)),
         ),
     )
 

@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime, timedelta, timezone
-
-from googleapiclient.errors import HttpError
 
 from shorts.ideas import sync_idea_state
 from shorts.markdown import parse_idea_file
 from shorts.project import Manifest, utcnow_iso
+from shorts.publish_target import PublishTarget
 from shorts.stages.plan import plan_opts_hash, subtitle_plan_args
-from shorts.youtube import get_credentials, insert_video, youtube_service
 
 _K_CAP = 3650
 
@@ -42,28 +39,6 @@ def cadence_from_manifest(pub: dict) -> dict | None:
         if valid_times:
             res["times"] = sorted(valid_times)
     return res
-
-
-def build_video_body(
-    *,
-    title: str,
-    description: str,
-    tags: str,
-    category_id: int,
-    publish_at: datetime | None,
-) -> dict:
-    body = {
-        "snippet": {
-            "title": title[:100],
-            "description": description,
-            "tags": [t.strip() for t in tags.split(",") if t.strip()],
-            "categoryId": str(category_id),
-        },
-        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
-    }
-    if publish_at is not None:
-        body["status"]["publishAt"] = iso(publish_at)
-    return body
 
 
 def resolve_schedule(
@@ -169,18 +144,10 @@ def resolve_schedule(
     return out
 
 
-def _http_reason(exc: HttpError) -> str:
-    try:
-        raw = exc.content.decode() if isinstance(exc.content, bytes) else exc.content
-        err = (json.loads(raw) or {}).get("error", {})
-        if err.get("errors"):
-            return err["errors"][0].get("reason") or err.get("message", "")
-        return err.get("message", "")
-    except Exception:
-        return getattr(exc, "reason", "") or str(exc)
-
-
-def run(project, config, *, slugs: list[str] | None = None, force: bool = False) -> None:
+def run(
+    project, config, target: "PublishTarget", *, slugs: list[str] | None = None,
+    force: bool = False,
+) -> None:
     from shorts.web.state import idea_freshness
 
     manifest = Manifest.load(project.manifest_path)
@@ -197,13 +164,15 @@ def run(project, config, *, slugs: list[str] | None = None, force: bool = False)
             return False
         return idea_freshness(project, s, manifest, opts_hash)["render"] == "fresh"
 
+    at_field = "publish_at" if target.supports_scheduling else "planned_at"
+
     # Full pending set, computed the same way as web.state.publish_queue's
     # slot_slugs: approved + fresh render + not yet uploaded. Independent of the
     # --slug filter and of force, so a per-row upload lands on the same slot the
     # web queue previewed for that slug.
     pending = [
         s for s in all_slugs
-        if eligible(s) and not manifest.get_idea(s).get("youtube")
+        if eligible(s) and not manifest.get_idea(s).get(target.key)
     ]
 
     candidates = [s for s in all_slugs if eligible(s)]
@@ -211,14 +180,14 @@ def run(project, config, *, slugs: list[str] | None = None, force: bool = False)
         want = set(slugs)
         candidates = [s for s in candidates if s in want]
     if not force:
-        candidates = [s for s in candidates if not manifest.get_idea(s).get("youtube")]
+        candidates = [s for s in candidates if not manifest.get_idea(s).get(target.key)]
 
     if not candidates:
         print("publish: nothing to upload")
         return
 
-    creds = get_credentials(config)
-    service = youtube_service(creds)
+    creds = target.get_credentials(config)
+    client = target.build_client(creds)
 
     overrides: dict[str, datetime] = {}
     taken: set[datetime] = set()
@@ -227,9 +196,9 @@ def run(project, config, *, slugs: list[str] | None = None, force: bool = False)
         if e.get("publish_at"):
             overrides[s] = parse_iso(e["publish_at"])
             taken.add(overrides[s])
-        yt = e.get("youtube") or {}
-        if yt.get("publish_at"):
-            taken.add(parse_iso(yt["publish_at"]))
+        pl = e.get(target.key) or {}
+        if pl.get(at_field):
+            taken.add(parse_iso(pl[at_field]))
 
     schedule = resolve_schedule(
         pending,
@@ -249,39 +218,29 @@ def run(project, config, *, slugs: list[str] | None = None, force: bool = False)
         # explicit per-idea publish_at always wins, even for forced re-uploads
         # (which are absent from `pending`, hence from `schedule`)
         at = overrides.get(s) or schedule.get(s)
-        body = build_video_body(
+        body = target.build_body(
             title=parsed.frontmatter.get("title") or s,
             description=parsed.description,
             tags=parsed.tags,
-            category_id=config.youtube.category_id,
             publish_at=at,
         )
         try:
-            res = insert_video(service, mp4_path=project.render_file(s), body=body)
-        except HttpError as exc:
-            status = getattr(exc.resp, "status", None)
-            reason = _http_reason(exc)
-            print(f"publish: {s} FAILED {status} {reason}")
+            res = target.upload(client, mp4_path=project.render_file(s), body=body)
+        except Exception as exc:  # a batch must not die on one un-typed upload error
+            info = target.parse_upload_error(exc)
+            print(f"publish: {s} FAILED {info['message']}")
             failed += 1
-            if status == 403 and "quota" in reason.lower():
-                print(f"publish: quota exhausted - {uploaded} uploaded, rest deferred")
+            if info.get("abort_batch"):
+                print(f"publish: aborting - {uploaded} uploaded, rest deferred")
                 break
             continue
-        except Exception as exc:  # a batch must not die on one un-typed upload error
-            print(f"publish: {s} FAILED {exc}")
-            failed += 1
-            continue
-        manifest.set_idea(s, youtube={
-            "video_id": res["video_id"],
-            "url": res["url"],
-            "publish_at": iso(at) if at else None,
-            "privacy": "private",
-            "uploaded_at": utcnow_iso(),
-            "title": body["snippet"]["title"],
-        })
+        record = dict(res)
+        record["uploaded_at"] = utcnow_iso()
+        record[at_field] = iso(at) if at else None
+        manifest.set_idea(s, **{target.key: record})
         manifest.save(project.manifest_path)
         uploaded += 1
-        print(f"publish: {s} -> {res['url']}")
+        print(f"publish: {s} -> {res.get('url') or res.get('publish_id')}")
 
     print(f"publish: uploaded {uploaded} video(s)")
     if failed:

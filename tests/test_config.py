@@ -248,6 +248,55 @@ def test_youtube_bad_category_id(tmp_path):
         load_config(tmp_path)
 
 
+def test_tiktok_defaults_when_section_absent(tmp_path, monkeypatch):
+    monkeypatch.delenv("TIKTOK_CLIENT_KEY", raising=False)
+    monkeypatch.delenv("TIKTOK_CLIENT_SECRET", raising=False)
+    _write(tmp_path)
+    cfg = load_config(tmp_path)
+    assert cfg.tiktok.client_key is None
+    assert cfg.tiktok.client_secret is None
+    assert cfg.tiktok.token_path == (tmp_path / ".tiktok_token.json").resolve()
+    assert cfg.tiktok.privacy_level == "SELF_ONLY"
+    assert cfg.tiktok.is_aigc is False
+    assert cfg.tiktok.disable_duet is False
+    assert cfg.tiktok.disable_stitch is False
+    assert cfg.tiktok.disable_comment is False
+
+
+def test_tiktok_section_parsed_and_resolved(tmp_path, monkeypatch):
+    monkeypatch.setenv("TIKTOK_CLIENT_KEY", "ck-123")
+    monkeypatch.setenv("TIKTOK_CLIENT_SECRET", "cs-456")
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (tmp_path / "config.toml").write_text(
+        f'projects_dir="projects"\nassets_dir="{_toml_path(assets)}"\n\n'
+        '[tiktok]\ntoken_path = "sub/tt.json"\n'
+        'privacy_level = "PUBLIC_TO_EVERYONE"\n'
+        "disable_duet = true\n"
+        "is_aigc = true\n"
+    )
+    _write_env(tmp_path)
+    cfg = load_config(tmp_path)
+    assert cfg.tiktok.client_key == "ck-123"
+    assert cfg.tiktok.client_secret == "cs-456"
+    assert cfg.tiktok.token_path == (tmp_path / "sub/tt.json").resolve()
+    assert cfg.tiktok.privacy_level == "PUBLIC_TO_EVERYONE"
+    assert cfg.tiktok.disable_duet is True
+    assert cfg.tiktok.disable_stitch is False
+    assert cfg.tiktok.disable_comment is False
+    assert cfg.tiktok.is_aigc is True
+
+
+def test_tiktok_bad_privacy_level(tmp_path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    (tmp_path / "config.toml").write_text(
+        f'projects_dir="projects"\nassets_dir="{_toml_path(assets)}"\n\n'
+        '[tiktok]\nprivacy_level = "PUBLIC"\n'
+    )
+    _write_env(tmp_path)
+    with pytest.raises(ConfigError, match="tiktok.privacy_level must be one of"):
+        load_config(tmp_path)
 
 
 def test_update_subtitle_config_updates_and_preserves_comments(tmp_path):

@@ -8,6 +8,7 @@ from shorts.config import Config, ConfigError, load_config
 from shorts.ideas import sync_idea_state
 from shorts.project import Manifest, Project, slugify
 from shorts.prompt import ensure_prompt_file
+from shorts.publish_target import PublishAuthError, PublishConfigError
 from shorts.stages import fetch as fetch_stage
 from shorts.stages import ideate as ideate_stage
 from shorts.stages import plan as plan_stage
@@ -276,59 +277,85 @@ def serve(ctx: click.Context, host: str, port: int, open_browser: bool) -> None:
     app.run(host=host, port=port, threaded=True, debug=False)
 
 
+def _register_target_commands(group, target_factory) -> None:
+    @group.command("auth")
+    @click.pass_context
+    def auth_cmd(ctx: click.Context) -> None:
+        """One-time browser consent for uploads."""
+        config = _config(ctx)
+        target = target_factory(config)
+        try:
+            creds = target.authorize(config)
+        except PublishConfigError as exc:
+            raise click.ClickException(str(exc))
+        try:
+            name = target.account_label(creds) or "(no account name)"
+        except Exception:
+            name = "(account name unavailable)"
+        click.echo(f"connected: {name}")
+
+    @group.command("status")
+    @click.pass_context
+    def status_cmd(ctx: click.Context) -> None:
+        """Show whether a usable token is present."""
+        config = _config(ctx)
+        target = target_factory(config)
+        try:
+            creds = target.get_credentials(config)
+        except PublishAuthError as exc:
+            click.echo(str(exc))
+            return
+        try:
+            name = target.account_label(creds) or "(no account name)"
+        except Exception:
+            name = "(account name unavailable)"
+        click.echo(f"connected: {name}")
+
+
+def _youtube_target(config):
+    from shorts.youtube import target
+    return target(config)
+
+
+def _tiktok_target(config):
+    from shorts.tiktok import target
+    return target(config)
+
+
 @cli.group()
 def youtube() -> None:
     """YouTube auth and status."""
 
 
-@youtube.command("auth")
-@click.pass_context
-def youtube_auth(ctx: click.Context) -> None:
-    """One-time (weekly) browser consent for uploads."""
-    config = _config(ctx)
-    from shorts.youtube import authorize, channel_title, YouTubeConfigError
-
-    try:
-        creds = authorize(config)
-    except YouTubeConfigError as exc:
-        raise click.ClickException(str(exc))
-    try:
-        name = channel_title(creds) or "(no channel name)"
-    except Exception:
-        name = "(channel name unavailable)"
-    click.echo(f"connected: {name}")
+_register_target_commands(youtube, _youtube_target)
 
 
-@youtube.command("status")
-@click.pass_context
-def youtube_status(ctx: click.Context) -> None:
-    """Show whether a usable YouTube token is present."""
-    config = _config(ctx)
-    from shorts.youtube import channel_title, get_credentials, YouTubeAuthError
+@cli.group()
+def tiktok() -> None:
+    """TikTok auth and status."""
 
-    try:
-        creds = get_credentials(config)
-    except YouTubeAuthError as exc:
-        click.echo(str(exc))
-        return
-    try:
-        name = channel_title(creds) or "(no channel name)"
-    except Exception:
-        name = "(channel name unavailable)"
-    click.echo(f"connected: {name}")
+
+_register_target_commands(tiktok, _tiktok_target)
 
 
 @cli.command()
 @click.argument("name", required=False)
+@click.option("--platform", "platform_name", type=click.Choice(["youtube", "tiktok"]),
+              default="youtube", help="Which platform to upload to.")
 @click.option("--slug", "slugs", multiple=True, help="Publish only these ideas.")
 @click.option("--force", is_flag=True, help="Re-upload even if already uploaded (new video).")
 @click.pass_context
-def publish(ctx: click.Context, name: str | None, slugs: tuple[str, ...], force: bool) -> None:
-    """Upload approved + rendered shorts to YouTube as scheduled-private."""
+def publish(
+    ctx: click.Context, name: str | None, platform_name: str,
+    slugs: tuple[str, ...], force: bool,
+) -> None:
+    """Upload approved + rendered shorts to the chosen platform."""
     config = _config(ctx)
     from shorts import publish as publish_mod
 
-    publish_mod.run(_resolve(config, name), config, slugs=list(slugs) or None, force=force)
+    target_factory = _youtube_target if platform_name == "youtube" else _tiktok_target
+    target = target_factory(config)
+    publish_mod.run(_resolve(config, name), config, target, slugs=list(slugs) or None, force=force)
 
 
 def main() -> None:

@@ -15,12 +15,13 @@ python -m shorts transcribe X           # ffmpeg + OpenAI Whisper -> transcript
 #   optional: edit ideas/prompt.json to steer idea generation (pt-BR brief by default)
 python -m shorts ideate X               # prompt.json + transcript -> ideas/NN-slug.md (each with "- [ ] Approved")
 #   review ideas/*.md, tick "- [x] Approved", edit narration if needed
-python -m shorts voice X                # Gemini TTS -> voice/NN-slug.mp3 for approved ideas
+python -m shorts voice X                # VoiceStudio TTS (cloned voice) -> voice/NN-slug.mp3 for approved ideas
 python -m shorts plan X                 # ai-vedit plan -> renders/NN-slug.plan.json
 #   review / edit renders/*.plan.json before rendering
 python -m shorts render X               # ai-vedit render (from the plan) -> renders/NN-slug.mp4
 python -m shorts youtube auth           # one-time Google OAuth consent -> saves a token
 python -m shorts publish X              # upload approved+rendered shorts (private + scheduled)
+python -m shorts publish X --platform tiktok   # same queue to TikTok (after `tiktok auth`)
 python -m shorts status [X]             # show stage + per-idea state
 ```
 
@@ -145,6 +146,48 @@ The Testing-mode refresh token lapses after ~7 days — re-run `youtube auth` wh
 on time regardless. Quota is ~6 uploads/day. Publishing is always an explicit
 action; nothing else in the pipeline touches YouTube.
 
+## TikTok publishing
+
+Upload rendered shorts to your own TikTok account through the Content Posting
+API (Direct Post). Unlike YouTube, TikTok has no scheduling: each upload posts
+**immediately**, and the cadence / planned-time fields don't apply to it.
+
+### One-time TikTok setup
+
+1. developers.tiktok.com → create an app and add the **Login Kit** and
+   **Content Posting API** products; request the `video.publish` scope.
+2. Under Login Kit → **Desktop**, register the redirect URI
+   `http://127.0.0.1:*` (loopback with a wildcard port; `tiktok auth` picks a
+   free port each run and uses PKCE).
+3. Put the app's credentials in `.env`:
+
+   ```
+   TIKTOK_CLIENT_KEY=...
+   TIKTOK_CLIENT_SECRET=...
+   ```
+
+4. Optionally tune `[tiktok]` in `config.toml` (see `config.example.toml`).
+
+An **unaudited** app can only post with `privacy_level = "SELF_ONLY"` (the
+default), and the posted videos stay private to your account. Getting
+`PUBLIC_TO_EVERYONE` requires passing TikTok's app audit. `publish` checks the
+account's allowed privacy levels via `creator_info` before uploading and stops
+the whole batch if the configured one isn't allowed.
+
+### Use
+
+```bash
+python -m shorts tiktok auth        # one browser consent; saves .tiktok_token.json
+python -m shorts tiktok status      # is a token present?
+python -m shorts publish X --platform tiktok
+python -m shorts publish X --platform tiktok --slug 01-foo   # just one
+```
+
+or the **TikTok** block of the **Publish** panel in the web UI. Each idea's
+YouTube and TikTok uploads are tracked separately, so publishing to one never
+marks the other as done. The token file is git-ignored; keep it out of shared
+folders.
+
 ## Setup
 
 ```bash
@@ -152,7 +195,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.toml config.toml   # then edit assets_dir etc.
-cp .env.example .env                 # then fill in OPENAI_API_KEY and GEMINI_API_KEY
+cp .env.example .env                 # then fill in OPENAI_API_KEY (TikTok keys optional)
 ```
 
 Requires `ffmpeg` and `ai-vedit` on `PATH`. `config.toml` and `.env` are read
@@ -169,9 +212,9 @@ python -m pytest
 ### TODO — expand test coverage
 
 - [ ] Stage-level tests for `fetch` / `transcribe` / `ideate` / `voice` /
-      `render` with the OpenAI/Gemini clients and `subprocess` (yt-dlp, ffmpeg,
+      `render` with the OpenAI/VoiceStudio clients and `subprocess` (yt-dlp, ffmpeg,
       ai-vedit) mocked — assert the files written and the manifest transitions.
 - [ ] End-to-end smoke test behind a `--runslow` marker: a ~20s clip through
-      all five stages against the real OpenAI/Gemini APIs and `ai-vedit`.
+      all five stages against the real OpenAI API, VoiceStudio and `ai-vedit`.
 - [ ] Browser/end-to-end test of the web UI (`shorts serve`): drive a project
       through the stages against a stubbed job runner.

@@ -2,7 +2,8 @@ import json
 from datetime import datetime, timedelta, timezone
 
 from shorts.config import (
-    Config, IdeateCfg, RenderCfg, SubtitleCfg, TranscribeCfg, VoiceCfg, YouTubeCfg,
+    Config, IdeateCfg, RenderCfg, SubtitleCfg, TikTokCfg, TranscribeCfg, VoiceCfg,
+    YouTubeCfg,
 )
 from shorts.project import Manifest, Project, sha256_text
 from shorts.publish import iso
@@ -39,6 +40,11 @@ def _config(tmp_path):
         youtube=YouTubeCfg(client_secret=None,
                            token_path=tmp_path / ".youtube_token.json",
                            category_id=22),
+        tiktok=TikTokCfg(client_key=None, client_secret=None,
+                         token_path=tmp_path / ".tiktok_token.json",
+                         privacy_level="SELF_ONLY",
+                         disable_duet=False, disable_stitch=False,
+                         disable_comment=False, is_aigc=False),
     )
 
 
@@ -225,7 +231,7 @@ def test_publish_queue_shape(tmp_path):
     assert by["01-x"]["render"] == "fresh"
     assert by["01-x"]["publish_at"] == start
     assert by["01-x"]["from_cadence"] is True
-    assert by["01-x"]["youtube"] is None
+    assert by["01-x"]["platform"] is None
     assert by["02-y"]["render"] == "missing"
     assert by["02-y"]["publish_at"] is None
 
@@ -244,4 +250,63 @@ def test_publish_queue_override_and_uploaded(tmp_path):
     q = publish_queue(project, cfg)
     it = q["items"][0]
     assert it["publish_at_override"] == "2026-10-01T12:00:00Z"
-    assert it["youtube"]["video_id"] == "vid"
+    assert it["platform"]["video_id"] == "vid"
+
+
+def test_publish_queue_tiktok_uses_planned_at_field(tmp_path):
+    from shorts.web.state import publish_queue
+    from shorts.project import Manifest
+    cfg, project = _project(tmp_path)
+    project.idea_file("01-x").write_text(_idea_md("01-x", "n", approved=True))
+    m = Manifest.load(project.manifest_path)
+    m.set_idea("01-x", approved=True, script_sha256="s",
+               tiktok={"video_id": "vid", "publish_id": "pub",
+                       "url": "https://www.tiktok.com/@x/video/vid",
+                       "planned_at": "2026-10-01T12:00:00Z",
+                       "uploaded_at": "2026-09-20T00:00:00Z"})
+    m.save(project.manifest_path)
+
+    q = publish_queue(project, cfg, "tiktok")
+    it = q["items"][0]
+    assert it["platform"]["video_id"] == "vid"
+    assert it["platform"]["publish_id"] == "pub"
+    assert it["platform"]["planned_at"] == "2026-10-01T12:00:00Z"
+    assert it["platform"]["publish_at"] is None
+
+
+def test_publish_queue_youtube_and_tiktok_are_independent(tmp_path):
+    from shorts.web.state import publish_queue, _opts_hash
+    from shorts.project import Manifest, sha256_file
+    cfg, project = _project(tmp_path)
+
+    for slug in ("01-x", "02-y"):
+        project.idea_file(slug).write_text(_idea_md(slug, f"n {slug}", approved=True))
+        project.render_file(slug).parent.mkdir(parents=True, exist_ok=True)
+        project.render_file(slug).write_bytes(b"mp4")
+        project.plan_file(slug).write_text('{"beats": []}')
+
+    m = Manifest.load(project.manifest_path)
+    for slug in ("01-x", "02-y"):
+        m.set_idea(slug, approved=True, script_sha256="s",
+                   voice={"path": f"voice/{slug}.mp3", "script_sha256": "s", "params_sha256": "vp"},
+                   plan={"path": f"renders/{slug}.plan.json", "script_sha256": "s",
+                         "voice_params_sha256": "vp", "opts_sha256": _opts_hash(cfg)},
+                   render={"path": f"renders/{slug}.mp4",
+                           "plan_sha256": sha256_file(project.plan_file(slug))})
+    # 01-x already published on youtube only; 02-y already published on tiktok only.
+    m.set_idea("01-x", youtube={"video_id": "vid1", "url": "https://youtu.be/vid1",
+                                 "publish_at": "2026-10-01T12:00:00Z",
+                                 "uploaded_at": "2026-09-20T00:00:00Z"})
+    m.set_idea("02-y", tiktok={"video_id": "vid2", "publish_id": "pub2",
+                                "url": "https://www.tiktok.com/@x/video/vid2",
+                                "planned_at": "2026-10-02T12:00:00Z",
+                                "uploaded_at": "2026-09-21T00:00:00Z"})
+    m.save(project.manifest_path)
+
+    yt_by = {i["slug"]: i for i in publish_queue(project, cfg, "youtube")["items"]}
+    assert yt_by["01-x"]["platform"] is not None
+    assert yt_by["02-y"]["platform"] is None  # tiktok-only publish doesn't count for youtube
+
+    tk_by = {i["slug"]: i for i in publish_queue(project, cfg, "tiktok")["items"]}
+    assert tk_by["02-y"]["platform"] is not None
+    assert tk_by["01-x"]["platform"] is None  # youtube-only publish doesn't count for tiktok

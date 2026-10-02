@@ -1,5 +1,6 @@
 import json
 import types
+from pathlib import Path
 
 import pytest
 
@@ -201,3 +202,81 @@ def test_insert_video_non_transient_reraises(tmp_path, monkeypatch):
     with pytest.raises(_FakeHttpError):
         yt.insert_video(_FakeService(_FakeRequest(fail_times=1, status=400)),
                         mp4_path=mp4, body={"snippet": {}})
+
+
+def test_upload_for_target_merges_privacy_and_title(tmp_path, monkeypatch):
+    import shorts.youtube as yt
+
+    body = {
+        "snippet": {"title": "My Title", "description": "d", "tags": [], "categoryId": "22"},
+        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
+    }
+    monkeypatch.setattr(
+        yt, "insert_video",
+        lambda client, *, mp4_path, body: {"video_id": "v1", "url": "u1"},
+    )
+    result = yt._upload_for_target(object(), mp4_path=Path("x.mp4"), body=body)
+    assert result == {
+        "video_id": "v1", "url": "u1",
+        "privacy": body["status"]["privacyStatus"],
+        "title": body["snippet"]["title"],
+    }
+
+
+def _http_error(status: int, payload: dict):
+    from googleapiclient.errors import HttpError
+
+    class _Resp:
+        def __init__(self, status):
+            self.status = status
+            self.reason = ""
+
+    return HttpError(_Resp(status), json.dumps(payload).encode())
+
+
+def test_parse_upload_error_quota_aborts_batch():
+    import shorts.youtube as yt
+
+    exc = _http_error(403, {"error": {"errors": [{"reason": "quotaExceeded"}]}})
+    assert yt._parse_upload_error(exc) == {
+        "message": "403 quotaExceeded", "abort_batch": True,
+    }
+
+
+def test_parse_upload_error_non_quota_http_error_does_not_abort():
+    import shorts.youtube as yt
+
+    exc = _http_error(500, {"error": {"message": "Internal error"}})
+    result = yt._parse_upload_error(exc)
+    assert result["abort_batch"] is False
+    assert result["message"] == "500 Internal error"
+
+
+def test_parse_upload_error_generic_exception():
+    import shorts.youtube as yt
+
+    assert yt._parse_upload_error(RuntimeError("boom")) == {
+        "message": "boom", "abort_batch": False,
+    }
+
+
+def test_target_returns_configured_publish_target(tmp_path):
+    import shorts.youtube as yt
+
+    config = types.SimpleNamespace(
+        youtube=types.SimpleNamespace(
+            client_secret=None,
+            token_path=tmp_path / ".youtube_token.json",
+            category_id=22,
+        )
+    )
+    t = yt.target(config)
+    assert t.key == "youtube"
+    assert t.label == "YouTube"
+    assert t.supports_scheduling is True
+    got = t.build_body(title="t", description="d", tags="a,b", publish_at=None)
+    expected = yt.build_video_body(
+        title="t", description="d", tags="a,b",
+        category_id=config.youtube.category_id, publish_at=None,
+    )
+    assert got == expected

@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from shorts.config import (
-    Config, IdeateCfg, RenderCfg, SubtitleCfg, TranscribeCfg, VoiceCfg, YouTubeCfg,
-    load_config,
+    Config, IdeateCfg, RenderCfg, SubtitleCfg, TikTokCfg, TranscribeCfg, VoiceCfg,
+    YouTubeCfg, load_config,
 )
 from shorts.project import Manifest, Project
 from shorts.web.app import create_app
@@ -40,6 +40,11 @@ def _config(tmp_path: Path) -> Config:
         youtube=YouTubeCfg(client_secret=None,
                            token_path=tmp_path / ".youtube_token.json",
                            category_id=22),
+        tiktok=TikTokCfg(client_key=None, client_secret=None,
+                         token_path=tmp_path / ".tiktok_token.json",
+                         privacy_level="SELF_ONLY",
+                         disable_duet=False, disable_stitch=False,
+                         disable_comment=False, is_aigc=False),
     )
 
 
@@ -577,6 +582,71 @@ def test_youtube_status_expired(client, monkeypatch):
     assert c.get("/api/youtube/status").get_json()["error"] == "token expired"
 
 
+def test_tiktok_status_not_configured(client):
+    c, _, _ = client
+    body = c.get("/api/tiktok/status").get_json()
+    assert body == {"connected": False, "channel": None, "error": "not configured"}
+
+
+def _tiktok_configured_client(tmp_path):
+    import dataclasses
+    cfg = _config(tmp_path)
+    cfg = dataclasses.replace(
+        cfg, tiktok=dataclasses.replace(cfg.tiktok, client_key="ck", client_secret="cs")
+    )
+    project = Project.create(cfg.projects_dir, "demo")
+    Manifest.new("demo").save(project.manifest_path)
+    project.idea_file("01-x").write_text(_idea_md("01-x", "the script", approved=True))
+    app = create_app(cfg)
+    app.config.update(TESTING=True)
+    return app.test_client(), cfg, project
+
+
+def test_tiktok_status_connected(tmp_path, monkeypatch):
+    c, _cfg, _ = _tiktok_configured_client(tmp_path)
+    import shorts.tiktok as tt
+    monkeypatch.setattr(tt, "get_credentials", lambda c: object())
+    monkeypatch.setattr(tt, "account_label", lambda c: "my_open_id")
+    body = c.get("/api/tiktok/status").get_json()
+    assert body == {"connected": True, "channel": "my_open_id", "error": None}
+
+
+def test_tiktok_status_expired(tmp_path, monkeypatch):
+    c, _cfg, _ = _tiktok_configured_client(tmp_path)
+    import shorts.tiktok as tt
+    monkeypatch.setattr(tt, "get_credentials",
+        lambda c: (_ for _ in ()).throw(tt.TikTokAuthError("x", reason="expired")))
+    assert c.get("/api/tiktok/status").get_json()["error"] == "token expired"
+
+
+def test_unknown_platform_status_404(client):
+    c, _, _ = client
+    assert c.get("/api/bogus/status").status_code == 404
+
+
+def test_unknown_platform_auth_404(client):
+    c, _, _ = client
+    assert c.post("/api/bogus/auth").status_code == 404
+
+
+def test_post_tiktok_auth_builds_argv(fake_client):
+    c, fake = fake_client
+    assert c.post("/api/tiktok/auth").status_code == 202
+    stage, _project, cmd = fake.started[-1]
+    assert stage == "tiktok-auth" and cmd[-2:] == ["tiktok", "auth"]
+
+
+def test_publish_queue_platform_query_param(client):
+    c, _, _ = client
+    resp = c.get("/api/projects/demo/publish?platform=tiktok")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["items"][0]["slug"] == "01-x"
+
+    bad = c.get("/api/projects/demo/publish?platform=bogus")
+    assert bad.status_code == 400
+
+
 def test_put_cadence_and_queue(client):
     c, _, project = client
     r = c.put("/api/projects/demo/publish/cadence",
@@ -659,11 +729,11 @@ def test_post_publish_builds_argv(fake_client):
     c, fake = fake_client
     assert c.post("/api/projects/demo/publish").status_code == 202
     stage, project, cmd = fake.started[-1]
-    assert stage == "publish" and cmd[-1] == "demo" and cmd[1:3] == ["-m", "shorts"]
+    assert stage == "publish" and cmd[-2:] == ["--platform", "youtube"] and cmd[1:3] == ["-m", "shorts"]
     fake.busy = False  # _FakeRunner does not auto-clear after a start
     c.post("/api/projects/demo/ideas/01-x/publish")
     _s, _p, cmd2 = fake.started[-1]
-    assert cmd2[-3:] == ["demo", "--slug", "01-x"]
+    assert cmd2[-6:] == ["publish", "demo", "--platform", "youtube", "--slug", "01-x"]
 
 
 def test_post_youtube_auth_builds_argv(fake_client):

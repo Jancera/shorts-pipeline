@@ -77,6 +77,30 @@ def test_publish_absent_loads_empty(tmp_path):
     assert Manifest.load(path).get_publish() == {}
 
 
+# accents + an em dash: not representable the same way in cp1252 as in UTF-8
+ACCENTED = "incríveis — ação"
+
+
+def test_save_writes_utf8_regardless_of_locale(tmp_path):
+    # ensure_ascii=False emits raw accents; the platform default encoding
+    # (cp1252 on Windows) must not decide how they hit the disk.
+    m = Manifest.new("demo")
+    m.source = {"title": ACCENTED}
+    path = tmp_path / "manifest.json"
+    m.save(path)
+
+    assert ACCENTED in path.read_bytes().decode("utf-8")
+
+
+def test_load_reads_utf8_regardless_of_locale(tmp_path):
+    path = tmp_path / "manifest.json"
+    path.write_bytes(
+        ('{"name": "demo", "source": {"title": "%s"}}' % ACCENTED).encode("utf-8")
+    )
+
+    assert Manifest.load(path).source["title"] == ACCENTED
+
+
 def test_stage_skipped(tmp_path):
     m = Manifest.new("demo")
     assert m.is_stage_skipped("fetch") is False
@@ -138,3 +162,31 @@ def test_settings_absent_loads_empty(tmp_path):
     assert loaded.settings == {}
     assert loaded.get_setting("count", default=6) == 6
 
+
+
+def test_concurrent_saves_do_not_collide(tmp_path):
+    # The UI fires two publish GETs at once and each one saves the manifest; a
+    # temp file shared between saves made one os.replace find its source gone.
+    import threading
+
+    path = tmp_path / "manifest.json"
+    Manifest.new("demo").save(path)
+    errors = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        m = Manifest.load(path)
+        barrier.wait()
+        try:
+            for _ in range(60):
+                m.save(path)
+        except Exception as exc:  # noqa: BLE001 - any failure is the bug
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+
+    assert errors == []
+    assert Manifest.load(path).name == "demo"
+    assert not list(tmp_path.glob("*.tmp"))

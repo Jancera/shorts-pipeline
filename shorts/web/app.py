@@ -28,6 +28,16 @@ _STATIC = Path(__file__).parent / "static"
 _TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
+def _target_for(platform: str, config):
+    if platform == "youtube":
+        from shorts.youtube import target
+    elif platform == "tiktok":
+        from shorts.tiktok import target
+    else:
+        raise ValueError(platform)
+    return target(config)
+
+
 def _atomic_write(path: Path, text: str) -> None:
     tmp_path: Path | None = None
     try:
@@ -494,31 +504,41 @@ def create_app(config: Config) -> Flask:
             "X-Accel-Buffering": "no",
         })
 
-    @app.get("/api/youtube/status")
-    def api_youtube_status():
-        from shorts.youtube import channel_title, get_credentials, YouTubeAuthError
-
-        if not config.youtube.client_secret and not config.youtube.token_path.exists():
+    @app.get("/api/<platform>/status")
+    def api_platform_status(platform):
+        from shorts.publish_target import PublishAuthError
+        if platform not in ("youtube", "tiktok"):
+            return _json_error(404, f"unknown platform: {platform}")
+        target = _target_for(platform, config)
+        if not target.is_configured(config):
             return jsonify({"connected": False, "channel": None, "error": "not configured"})
         try:
-            creds = get_credentials(config)
-        except YouTubeAuthError as exc:
+            creds = target.get_credentials(config)
+        except PublishAuthError as exc:
             err = "token expired" if getattr(exc, "reason", "") == "expired" else "not connected"
             return jsonify({"connected": False, "channel": None, "error": err})
         try:
-            ch = channel_title(creds)
+            ch = target.account_label(creds)
         except Exception:
             ch = None
         return jsonify({"connected": True, "channel": ch, "error": None})
 
-    @app.post("/api/youtube/auth")
-    def api_youtube_auth():
-        cmd = [sys.executable, "-m", "shorts", *stage_argv("youtube-auth", "")]
+    @app.post("/api/<platform>/auth")
+    def api_platform_auth(platform):
+        if platform not in ("youtube", "tiktok"):
+            return _json_error(404, f"unknown platform: {platform}")
+        cmd = [sys.executable, "-m", "shorts", *stage_argv(f"{platform}-auth", "")]
         try:
-            _runner().start("youtube-auth", "", cmd)
+            _runner().start(f"{platform}-auth", "", cmd)
         except JobBusy as exc:
             return _json_error(409, str(exc))
         return jsonify(_runner().state()), 202
+
+    def _platform_from_query():
+        platform = request.args.get("platform", "youtube")
+        if platform not in ("youtube", "tiktok"):
+            return None, _json_error(400, f"unknown platform: {platform}")
+        return platform, None
 
     @app.get("/api/projects/<name>/publish")
     def api_publish_queue(name: str):
@@ -526,16 +546,22 @@ def create_app(config: Config) -> Flask:
             project = _load_project(config, name)
         except FileNotFoundError:
             return _json_error(404, f"no such project: {name}")
-        return jsonify(publish_queue(project, config))
+        platform, err = _platform_from_query()
+        if err:
+            return err
+        return jsonify(publish_queue(project, config, platform))
 
     @app.put("/api/projects/<name>/publish/cadence")
     def api_put_cadence(name: str):
-        # function-local on purpose: shorts.publish imports googleapiclient at module scope
+        # function-local: keeps import cost out of routes that don't touch publish/scheduling
         from shorts.publish import parse_iso
         try:
             project = _load_project(config, name)
         except FileNotFoundError:
             return _json_error(404, f"no such project: {name}")
+        platform, err = _platform_from_query()
+        if err:
+            return err
         body = request.get_json(silent=True) or {}
         manifest = Manifest.load(project.manifest_path)
         start = body.get("start")
@@ -583,11 +609,11 @@ def create_app(config: Config) -> Flask:
                 pub["times"] = cleaned_times
             manifest.publish = pub
         manifest.save(project.manifest_path)
-        return jsonify(publish_queue(project, config))
+        return jsonify(publish_queue(project, config, platform))
 
     @app.put("/api/projects/<name>/ideas/<slug>/publish-at")
     def api_put_publish_at(name: str, slug: str):
-        # function-local on purpose: shorts.publish imports googleapiclient at module scope
+        # function-local: keeps import cost out of routes that don't touch publish/scheduling
         from shorts.publish import parse_iso
         try:
             project = _load_project(config, name)
@@ -595,6 +621,9 @@ def create_app(config: Config) -> Flask:
             return _json_error(404, f"no such project: {name}")
         if not project.idea_file(slug).exists():
             return _json_error(404, f"no such idea: {slug}")
+        platform, err = _platform_from_query()
+        if err:
+            return err
         body = request.get_json(silent=True) or {}
         manifest = Manifest.load(project.manifest_path)
         pa = body.get("publish_at")
@@ -609,11 +638,11 @@ def create_app(config: Config) -> Flask:
                 return _json_error(422, "publish_at must be an ISO datetime")
             manifest.set_idea(slug, publish_at=str(pa))
         manifest.save(project.manifest_path)
-        return jsonify(publish_queue(project, config))
+        return jsonify(publish_queue(project, config, platform))
 
-    def _start_publish(name, slugs):
+    def _start_publish(name, slugs, platform):
         cmd = [sys.executable, "-m", "shorts",
-               *stage_argv("publish", name, slugs=slugs)]
+               *stage_argv("publish", name, slugs=slugs, platform=platform)]
         try:
             _runner().start("publish", name, cmd)
         except JobBusy as exc:
@@ -626,7 +655,8 @@ def create_app(config: Config) -> Flask:
             _load_project(config, name)
         except FileNotFoundError:
             return _json_error(404, f"no such project: {name}")
-        return _start_publish(name, None)
+        body = request.get_json(silent=True) or {}
+        return _start_publish(name, None, str(body.get("platform") or "youtube"))
 
     @app.post("/api/projects/<name>/ideas/<slug>/publish")
     def api_publish_one(name: str, slug: str):
@@ -634,7 +664,8 @@ def create_app(config: Config) -> Flask:
             _load_project(config, name)
         except FileNotFoundError:
             return _json_error(404, f"no such project: {name}")
-        return _start_publish(name, [slug])
+        body = request.get_json(silent=True) or {}
+        return _start_publish(name, [slug], str(body.get("platform") or "youtube"))
 
     @app.post("/api/jobs/current/cancel")
     def api_cancel():

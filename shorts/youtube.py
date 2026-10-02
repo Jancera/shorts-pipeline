@@ -1,22 +1,23 @@
 from __future__ import annotations
 
 import http.client
+import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from shorts.config import Config
+from shorts.publish_target import PublishAuthError, PublishConfigError, PublishTarget
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 
-class YouTubeAuthError(Exception):
-    def __init__(self, message: str, *, reason: str = "missing") -> None:
-        super().__init__(message)
-        self.reason = reason
+class YouTubeAuthError(PublishAuthError):
+    pass
 
 
-class YouTubeConfigError(Exception):
+class YouTubeConfigError(PublishConfigError):
     pass
 
 
@@ -105,3 +106,72 @@ def insert_video(service, *, mp4_path: Path, body: dict, max_retries: int = 5) -
                 continue
             raise
     return {"video_id": response["id"], "url": f"https://youtu.be/{response['id']}"}
+
+
+def _iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_video_body(
+    *,
+    title: str,
+    description: str,
+    tags: str,
+    category_id: int,
+    publish_at: datetime | None,
+) -> dict:
+    body = {
+        "snippet": {
+            "title": title[:100],
+            "description": description,
+            "tags": [t.strip() for t in tags.split(",") if t.strip()],
+            "categoryId": str(category_id),
+        },
+        "status": {"privacyStatus": "private", "selfDeclaredMadeForKids": False},
+    }
+    if publish_at is not None:
+        body["status"]["publishAt"] = _iso(publish_at)
+    return body
+
+
+def _http_reason(exc: HttpError) -> str:
+    from googleapiclient.errors import HttpError
+
+    try:
+        raw = exc.content.decode() if isinstance(exc.content, bytes) else exc.content
+        err = (json.loads(raw) or {}).get("error", {})
+        if err.get("errors"):
+            return err["errors"][0].get("reason") or err.get("message", "")
+        return err.get("message", "")
+    except Exception:
+        return getattr(exc, "reason", "") or str(exc)
+
+
+def _upload_for_target(client, *, mp4_path: Path, body: dict) -> dict:
+    res = insert_video(client, mp4_path=mp4_path, body=body)
+    return {**res, "privacy": body["status"]["privacyStatus"], "title": body["snippet"]["title"]}
+
+
+def _parse_upload_error(exc: Exception) -> dict:
+    from googleapiclient.errors import HttpError
+
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        reason = _http_reason(exc)
+        abort = status == 403 and "quota" in reason.lower()
+        return {"message": f"{status} {reason}", "abort_batch": abort}
+    return {"message": str(exc), "abort_batch": False}
+
+
+def target(config) -> PublishTarget:
+    from functools import partial
+
+    return PublishTarget(
+        key="youtube", label="YouTube", supports_scheduling=True,
+        is_configured=lambda c: bool(c.youtube.client_secret) or c.youtube.token_path.exists(),
+        get_credentials=get_credentials, authorize=authorize, account_label=channel_title,
+        build_client=youtube_service,
+        build_body=partial(build_video_body, category_id=config.youtube.category_id),
+        upload=_upload_for_target,
+        parse_upload_error=_parse_upload_error,
+    )
